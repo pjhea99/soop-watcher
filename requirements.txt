@@ -1,0 +1,4 @@
+websockets
+certifi
+aiohttp
+requests
