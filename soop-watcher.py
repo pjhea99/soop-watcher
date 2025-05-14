@@ -1,10 +1,11 @@
+import aiohttp
 import asyncio
 import ssl
 import certifi
 import websockets
+import random
 import requests
 import re
-import aiohttp
 from collections import defaultdict
 from playwright.async_api import async_playwright
 from datetime import datetime
@@ -19,6 +20,8 @@ CATEGORY_URL = "https://www.sooplive.co.kr/directory/category/%EC%8A%A4%ED%83%80
 
 F = "\x0c"
 ESC = "\x1b\t"
+MAX_RETRIES = 2
+
 
 PREV_WATCHING = defaultdict(set)     # {uid: set of stream_ids}
 CURRENT_WATCHING = defaultdict(set)  # {uid: set of stream_ids}
@@ -38,32 +41,36 @@ def now():
 def log(bid, msg):
     print(f"{now()}[{bid:>13}] {msg}")
 
-def get_player_live(bno, bid):
-    url = 'https://live.sooplive.co.kr/afreeca/player_live_api.php'
+
+import aiohttp
+
+async def get_player_live(bno, bid):
+    url = "https://live.sooplive.co.kr/afreeca/player_live_api.php"
     data = {
-        'bid': bid,
-        'bno': bno,
-        'type': 'live',
-        'confirm_adult': 'false',
-        'player_type': 'html5',
-        'mode': 'landing',
-        'from_api': '0',
-        'pwd': '',
-        'stream_type': 'common',
-        'quality': 'HD'
+        'bid': bid, 'bno': bno, 'type': 'live',
+        'confirm_adult': 'false', 'player_type': 'html5',
+        'mode': 'landing', 'from_api': '0', 'pwd': '',
+        'stream_type': 'common', 'quality': 'HD'
     }
+
+    headers = {
+        "User-Agent": "python-requests/2.28.1"
+    }
+
     try:
-        response = requests.post(f'{url}?bjid={bid}', data=data)
-        response.raise_for_status()
-        res = response.json()
-        chdomain = res["CHANNEL"]["CHDOMAIN"].lower()
-        chatno = res["CHANNEL"]["CHATNO"]
-        ftk = res["CHANNEL"]["FTK"]
-        chpt = str(int(res["CHANNEL"]["CHPT"]) + 1)
-        return chdomain, chatno, ftk, chpt, res["CHANNEL"]["TITLE"]
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(f'{url}?bjid={bid}', data=data, timeout=10) as resp:
+                res = await resp.json(content_type=None)  # ← 핵심 수정
+                ch = res["CHANNEL"]
+                return ch["CHDOMAIN"].lower(), ch["CHATNO"], ch["FTK"], str(int(ch["CHPT"]) + 1), ch["TITLE"]
+
     except Exception as e:
         log(bid, f"[API ERROR] 요청 실패 - {e}")
         return None, None, None, None, None
+
+
+
+
 
 def make_packets(chatno):
     connect_packet = f'{ESC}000100000600{F*3}16{F}'
@@ -135,11 +142,12 @@ async def extract_starcraft_streams():
     print(f"{now()} 📦 총 {len(results)}개의 방송 수집 완료")
     return results
 
+
 async def watch_stream(index, total, bid, bno):
+    stream_id = f"{bid}/{bno}"
     log(bid, f"방송 연결 시도 중 📺[{index}/{total}]")
     start_time = datetime.now()
-
-    chdomain, chatno, ftk, chpt, stream_title = get_player_live(bno, bid)
+    chdomain, chatno, ftk, chpt, stream_title = await get_player_live(bno, bid)
     if not chdomain:
         log(bid, f"[!] 방송 정보 스킵됨")
         return
@@ -151,100 +159,95 @@ async def watch_stream(index, total, bid, bno):
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
 
-    seen_viewers = defaultdict(str)
-    try:
-        async with websockets.connect(uri, subprotocols=['chat'], ssl=ssl_context, ping_interval=None) as websocket:
-            await websocket.send(connect_packet)
-            await asyncio.sleep(1)
-            await websocket.send(join_packet)
-            log(bid, f"WebSocket 연결됨: ✅")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            await asyncio.sleep(random.uniform(0.3, 1.5))  # 랜덤 지연
 
-            stop_event = asyncio.Event()
+            seen_viewers = defaultdict(str)
+            async with websockets.connect(
+                uri,
+                subprotocols=['chat'],
+                ssl=ssl_context,
+                ping_interval=None,
+                open_timeout=10
+            ) as websocket:
+                await websocket.send(connect_packet)
+                await asyncio.sleep(1)
+                await websocket.send(join_packet)
+                log(bid, f"WebSocket 연결됨 ✅ (시도 {attempt}/{MAX_RETRIES})")
 
-            async def ping():
-                while not stop_event.is_set():
-                    await asyncio.sleep(60)
-                    await websocket.send(ping_packet)
+                stop_event = asyncio.Event()
 
-            async def receive():
-                while True:
-                    try:
-                        # ⏱️ 10초 안에 패킷이 안 오면 asyncio.TimeoutError 발생
-                        msg = await asyncio.wait_for(websocket.recv(), timeout=6)
-                    except asyncio.TimeoutError:
-                        log(bid, f"⏰ 10초 동안 패킷 없음 → 타임아웃 종료")
-                        await websocket.close()
-                        stop_event.set()
-                        break
-                    except websockets.exceptions.ConnectionClosed:
-                        log(bid, f"❌ WebSocket 연결 종료됨")
-                        break
-                    except Exception as e:
-                        log(bid, f"❗ 수신 오류: {type(e).__name__}: {e}")
-                        break
+                async def ping():
+                    while not stop_event.is_set():
+                        await asyncio.sleep(60)
+                        await websocket.send(ping_packet)
 
-                    if isinstance(msg, bytes):
-                        text = msg.decode('utf-8', errors='ignore')
+                async def receive():
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(websocket.recv(), timeout=10)
+                        except asyncio.TimeoutError:
+                            log(bid, f"⏰ 수신 없음 - 타임아웃 종료")
+                            stop_event.set()
+                            break
+                        except websockets.exceptions.ConnectionClosed:
+                            log(bid, f"❌ WebSocket 연결 종료됨")
+                            break
+                        except Exception as e:
+                            log(bid, f"❗ 수신 오류: {type(e).__name__}: {e}")
+                            break
 
-                        if text.startswith(f'{ESC}0004'):
-                            parts = text.split(F)
+                        if isinstance(msg, bytes):
+                            text = msg.decode('utf-8', errors='ignore')
+                            if text.startswith(f'{ESC}0004'):
+                                parts = text.split(F)
+                                packet_viewer_count = 0
+                                new_count = 0
 
-                            packet_viewer_count = 0
-                            new_count = 0
 
-                            for i in range(2, len(parts) - 2, 3):
-                                try:
-                                    nickname = parts[i]
-                                    nickname_cleaned = re.sub(r"\(\d+\)$", "", nickname)
-                                    display_name = parts[i+1]
-                                    info = parts[i+2]
+                                for i in range(2, len(parts) - 2, 3):
+                                    try:
+                                        uid = re.sub(r"\(\d+\)$", "", parts[i])
+                                        nick = parts[i + 1]
+                                        info = parts[i + 2]
+                                        packet_viewer_count += 1
+                                        if uid not in seen_viewers:
+                                            seen_viewers[uid] = f"{nick} | {info}"
+                                            new_count += 1
+                                    except IndexError:
+                                        continue
+                                log(bid, f"📥 시청자 패킷 수신 – 현재 패킷: {packet_viewer_count}명 (신규 {new_count}명) (총 {len(seen_viewers)}명)")    
+                                if packet_viewer_count < 40:
+                                    log(bid, "📉 시청자 40명 미만 → 감시 종료")
+                                    stop_event.set()
+                                    break
 
-                                    packet_viewer_count += 1
+                ping_task = asyncio.create_task(ping())
+                await receive()
+                ping_task.cancel()
+                await asyncio.sleep(0.3)
 
-                                    if nickname_cleaned not in seen_viewers:
-                                        seen_viewers[nickname_cleaned] = f"{display_name} | {info}"
-                                        new_count += 1
-                                except IndexError:
-                                    continue
+            # 감시 대상 처리
+            filtered_target_ids = {tid.lower() for tid in TARGET_IDS if tid.lower() != bid.lower()}
+            matched = [uid for uid in seen_viewers if uid in filtered_target_ids]
 
-                            log(bid, f"📥 시청자 패킷 수신 – 현재 패킷: {packet_viewer_count}명 (신규 {new_count}명) (총 {len(seen_viewers)}명)")
+            for uid in matched:
+                display_name = seen_viewers[uid].split('|')[0].strip()
+                NICKNAMES[uid] = display_name
+                CURRENT_WATCHING[uid].add(stream_id)
 
-                            # 40명 미만이면 종료
-                            if packet_viewer_count < 40:
-                                log(bid, f"✅ 패킷 인원이 40명 미만이므로 감시 종료")
-                                await websocket.close()
-                                stop_event.set()
-                                break
+            return  # 정상 종료
 
-            ping_task = asyncio.create_task(ping())
-            await receive()
-            ping_task.cancel()
-            await asyncio.sleep(0.5)
+        except Exception as e:
+            log(bid, f"🛑 WebSocket 연결 실패 (시도 {attempt}/{MAX_RETRIES}): {e}")
+            await asyncio.sleep(1 + attempt * 1.5)
+        finally:
+            duration = (datetime.now() - start_time).total_seconds()
+            log(bid, f"감시 시간: {duration:.1f}초 ⏱️ ")
+    log(bid, "🚫 최종 실패 → 방송 감시 포기")
 
-        filtered_target_ids = {tid.lower() for tid in TARGET_IDS if tid.lower() != bid.lower()}
-        if not filtered_target_ids:
-            log(bid, f"현재 방송은 감시 대상이지만 비교할 다른 대상이 없으므로 스킵됩니다. 🙅‍♂️")
-            return
-
-        matched = [uid for uid in seen_viewers if uid in filtered_target_ids]
-        if matched:
-            matched_info = [(uid, seen_viewers[uid].split('|')[0].strip()) for uid in matched]
-            #await send_discord_alert(matched_info, stream_title, bid, bno)
-        else:
-            log(bid, f"감시 대상 없음. 다음 방송으로 이동합니다. ❌")
-
-        for uid in filtered_target_ids:
-            if uid in seen_viewers:
-                NICKNAMES[uid] = seen_viewers[uid].split('|')[0].strip()
-                CURRENT_WATCHING[uid].add(f"{bid}/{bno}")
-    
-    except Exception as e:
-        log(bid, f"[!] WebSocket 실패 : {type(e).__name__}: {e}")
-    finally:
-        duration = (datetime.now() - start_time).total_seconds()
-        log(bid, f"감시 시간: {duration:.1f}초 ⏱️ ")
-
-async def limited_watch(streams, limit=10):
+async def limited_watch(streams, limit=20):
     sem = asyncio.Semaphore(limit)
 
     async def wrapper(index, stream):
@@ -254,7 +257,7 @@ async def limited_watch(streams, limit=10):
     tasks = [asyncio.create_task(wrapper(i, stream)) for i, stream in enumerate(streams)]
     await asyncio.gather(*tasks)
 
-async def batch_watch(streams, batch_size=20, limit=10):
+async def batch_watch(streams, batch_size=20, limit=20):
     total = len(streams)
     total_batches = (total + batch_size - 1) // batch_size
 
@@ -323,13 +326,14 @@ async def main():
 
     streams = await extract_starcraft_streams()
     print(f"{now()} 📺 감시 대상 방송 수: {len(streams)}")
-    await batch_watch(streams, batch_size=20, limit=10)
+    await batch_watch(streams, batch_size=30, limit=30)
     await compare_and_alert_watch_changes(streams)
+    print(f"{now()} 📺 2분 뒤에 감시 시작")
 
 async def main_loop():
     while True:
         await main()
-        await asyncio.sleep(60)  # 5분 간격 반복
+        await asyncio.sleep(120)  # 2분 간격 반복
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
