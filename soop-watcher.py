@@ -20,6 +20,9 @@ CATEGORY_URL = "https://www.sooplive.co.kr/directory/category/%EC%8A%A4%ED%83%80
 F = "\x0c"
 ESC = "\x1b\t"
 
+PREV_WATCHING = defaultdict(set)     # {uid: set of stream_ids}
+CURRENT_WATCHING = defaultdict(set)  # {uid: set of stream_ids}
+NICKNAMES = dict()  # uid → 닉네임
 
 def load_target_ids(filename="targets.txt"):
     try:
@@ -75,6 +78,11 @@ async def send_discord_alert(matched_info, title, bid, bno):
     log(bid, f"{message}")
     async with aiohttp.ClientSession() as session:
         await session.post(DISCORD_WEBHOOK_URL, json={"content": message})
+
+async def send_discord(message):
+    async with aiohttp.ClientSession() as session:
+        await session.post(DISCORD_WEBHOOK_URL, json={"content": message})
+
 
 async def extract_starcraft_streams():
     print(f"{now()} 📡 스타크래프트 카테고리 API 호출 중...")
@@ -221,9 +229,15 @@ async def watch_stream(index, total, bid, bno):
         matched = [uid for uid in seen_viewers if uid in filtered_target_ids]
         if matched:
             matched_info = [(uid, seen_viewers[uid].split('|')[0].strip()) for uid in matched]
-            await send_discord_alert(matched_info, stream_title, bid, bno)
+            #await send_discord_alert(matched_info, stream_title, bid, bno)
         else:
             log(bid, f"감시 대상 없음. 다음 방송으로 이동합니다. ❌")
+
+        for uid in filtered_target_ids:
+            if uid in seen_viewers:
+                NICKNAMES[uid] = seen_viewers[uid].split('|')[0].strip()
+                CURRENT_WATCHING[uid].add(f"{bid}/{bno}")
+    
     except Exception as e:
         log(bid, f"[!] WebSocket 실패 : {type(e).__name__}: {e}")
     finally:
@@ -253,8 +267,55 @@ async def batch_watch(streams, batch_size=20, limit=10):
         if batch_idx < total_batches:
             print(f"{now()} ⏸️ 다음 배치까지 잠시 대기...")
             await asyncio.sleep(1)  # 각 배치 간 약간의 딜레이
+
+async def compare_and_alert_watch_changes(streams):
+    global PREV_WATCHING
+    stream_title_map = {f"{s['bid']}/{s['bno']}": s["title"] for s in streams}
+    stream_url_map = {f"{s['bid']}/{s['bno']}": f"https://play.sooplive.co.kr/{s['bid']}/{s['bno']}" for s in streams}
+
+    broadcast_events = defaultdict(list)
+    anyone_watching_now = False
+
+    for uid in TARGET_IDS:
+        prev = PREV_WATCHING[uid]
+        curr = CURRENT_WATCHING[uid]
+        started = curr - prev
+        stopped = prev - curr
+
+        for sid in started:
+            broadcast_events[sid].append((uid, "started"))
+
+        for sid in stopped:
+            broadcast_events[sid].append((uid, "stopped"))
+
+        if curr:
+            anyone_watching_now = True
+
+        PREV_WATCHING[uid] = curr.copy()
+
+    for sid, events in broadcast_events.items():
+        bid, bno = sid.split("/")
+        title = stream_title_map.get(sid, "(제목 없음)")
+        url = stream_url_map.get(sid, f"https://play.sooplive.co.kr/{bid}/{bno}")
+
+        started_users = [uid for uid, action in events if action == "started"]
+        stopped_users = [uid for uid, action in events if action == "stopped"]
+
+        message = f"📺 **[{title}]({url})** 방송 상태 변경\n"
+        if started_users:
+            message += "🔔 시청 시작: " + ", ".join(f"{NICKNAMES.get(uid, '닉네임')}({uid})" for uid in started_users) + "\n"
+        if stopped_users:
+            message += "🔕 시청 종료: " + ", ".join(f"{NICKNAMES.get(uid, '닉네임')}({uid})" for uid in stopped_users)
+
+        await send_discord(message)
+
+    if not anyone_watching_now and any(PREV_WATCHING[uid] for uid in TARGET_IDS):
+        await send_discord("📴 감시 대상들이 현재 어떤 방송도 시청하지 않고 있습니다.")
+
+
 async def main():
-    global TARGET_IDS
+    global TARGET_IDS, CURRENT_WATCHING
+    CURRENT_WATCHING = defaultdict(set) 
     TARGET_IDS = load_target_ids()  # 외부에서 로드
     if not TARGET_IDS:
         print(f"{now()} 감시 대상이 없습니다. 종료합니다.")
@@ -263,6 +324,12 @@ async def main():
     streams = await extract_starcraft_streams()
     print(f"{now()} 📺 감시 대상 방송 수: {len(streams)}")
     await batch_watch(streams, batch_size=20, limit=10)
+    await compare_and_alert_watch_changes(streams)
+
+async def main_loop():
+    while True:
+        await main()
+        await asyncio.sleep(60)  # 5분 간격 반복
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_loop())
