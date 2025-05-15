@@ -8,7 +8,7 @@ import requests
 import re
 from collections import defaultdict
 from playwright.async_api import async_playwright
-from datetime import datetime
+from datetime import datetime, timezone
 from asyncio import TimeoutError, wait_for
 
 API_URL = "https://sch.sooplive.co.kr/api.php"
@@ -41,9 +41,6 @@ def now():
 def log(bid, msg):
     print(f"{now()}[{bid:>13}] {msg}")
 
-
-import aiohttp
-
 async def get_player_live(bno, bid):
     url = "https://live.sooplive.co.kr/afreeca/player_live_api.php"
     data = {
@@ -69,22 +66,11 @@ async def get_player_live(bno, bid):
         return None, None, None, None, None
 
 
-
-
-
 def make_packets(chatno):
     connect_packet = f'{ESC}000100000600{F*3}16{F}'
     join_packet = f'{ESC}0002{len(chatno)+6:06}00{F}{chatno}{F*5}'
     ping_packet = f'{ESC}000000000100{F}'
     return connect_packet, join_packet, ping_packet
-
-async def send_discord_alert(matched_info, title, bid, bno):
-    stream_url = f"https://play.sooplive.co.kr/{bid}/{bno}"
-    user_info = ", ".join([f"**{nick}({uid})**" for uid, nick in matched_info])
-    message = f"🔔 {user_info} 님이 [**{title}**]({stream_url}) 방송을 보고 있습니다."
-    log(bid, f"{message}")
-    async with aiohttp.ClientSession() as session:
-        await session.post(DISCORD_WEBHOOK_URL, json={"content": message})
 
 async def send_discord(message):
     async with aiohttp.ClientSession() as session:
@@ -126,9 +112,11 @@ async def extract_starcraft_streams():
                             results.append({
                                 "bid": bid,
                                 "bno": str(bno),
+                                "nick": stream.get("user_nick", "") ,
                                 "url": url,
                                 "title": stream.get("broad_title", ""),
-                                "view_cnt": stream.get("view_cnt", 0)
+                                "view_cnt": stream.get("view_cnt", 0),                                
+                                "thumb": stream.get("thumbnail", "")
                             })
 
                     if not data.get("is_more"):
@@ -236,7 +224,6 @@ async def watch_stream(index, total, bid, bno):
                 display_name = seen_viewers[uid].split('|')[0].strip()
                 NICKNAMES[uid] = display_name
                 CURRENT_WATCHING[uid].add(stream_id)
-
             return  # 정상 종료
 
         except Exception as e:
@@ -271,10 +258,63 @@ async def batch_watch(streams, batch_size=20, limit=20):
             print(f"{now()} ⏸️ 다음 배치까지 잠시 대기...")
             await asyncio.sleep(1)  # 각 배치 간 약간의 딜레이
 
+def soop_profile_image(uid: str) -> str:
+    if len(uid) < 2:
+        return ""
+    first = uid[0]
+    second = uid[1]
+    return f"https://profile.img.sooplive.co.kr/LOGO/{first}{second}/{uid}/{uid}.jpg"
+
+def soop_user_url(uid: str) -> str:
+    return f"https://ch.sooplive.co.kr/{uid}"
+
+async def send_individual_embed(title, url, image_url, viewer_info, bj_nick, started=True):
+    """
+    Send a separate embed per viewer.
+
+    :param title: 방송 제목
+    :param url: 방송 URL
+    :param image_url: 방송 썸네일 (시청 시작일 때만 사용)
+    :param viewer_info: List of (uid, nickname)
+    :param started: True if started watching, False if stopped
+    :param bj_nick: 방송 닉네임
+    """
+    color = 0x00ccff if started else 0xff0000
+    footer_text = f"{bj_nick}님의 방송 시청을 {'시작' if started else '종료'}하였습니다"
+
+    for uid, nickname in viewer_info:
+        embed = {
+            "title": title,
+            "url": url,
+            "color": color,
+            "author": {
+                "name": nickname,
+                "url": f"https://ch.sooplive.co.kr/{uid}",
+                "icon_url": f"https://profile.img.sooplive.co.kr/LOGO/{uid[0]}{uid[1]}/{uid}/{uid}.jpg"
+            },
+            "footer": {
+                "text": footer_text
+            },
+            "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        }
+
+        if started and image_url:
+            embed["image"] = {"url": image_url}
+
+        async with aiohttp.ClientSession() as session:
+            await session.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]})
+
 async def compare_and_alert_watch_changes(streams):
     global PREV_WATCHING
-    stream_title_map = {f"{s['bid']}/{s['bno']}": s["title"] for s in streams}
-    stream_url_map = {f"{s['bid']}/{s['bno']}": f"https://play.sooplive.co.kr/{s['bid']}/{s['bno']}" for s in streams}
+    stream_info_map = {
+        f"{s['bid']}/{s['bno']}": {
+            "title": s["title"],
+            "url": f"https://play.sooplive.co.kr/{s['bid']}/{s['bno']}",
+            "thumb": s.get("thumb", ""),
+            "nick": s.get("nick", "")
+        }
+        for s in streams
+    }
 
     broadcast_events = defaultdict(list)
     anyone_watching_now = False
@@ -296,21 +336,24 @@ async def compare_and_alert_watch_changes(streams):
 
         PREV_WATCHING[uid] = curr.copy()
 
+    # 방송별 알림 전송
     for sid, events in broadcast_events.items():
         bid, bno = sid.split("/")
-        title = stream_title_map.get(sid, "(제목 없음)")
-        url = stream_url_map.get(sid, f"https://play.sooplive.co.kr/{bid}/{bno}")
+        info = stream_info_map.get(sid, {"title": "(제목 없음)", "url": "", "thumb": "", "nick": ""})
+        title = info["title"]
+        url = info["url"]
+        thumb_url = info["thumb"]
+        bj_nick = info["nick"]
 
-        started_users = [uid for uid, action in events if action == "started"]
-        stopped_users = [uid for uid, action in events if action == "stopped"]
+        # 시청 시작한 감시 대상만 필터링하여 embed로 전송
+        started_viewers = [(uid, NICKNAMES.get(uid, uid)) for uid, action in events if action == "started"]
+        if started_viewers:
+            await send_individual_embed(title, url, thumb_url, started_viewers, bj_nick, started=True)
 
-        message = f"📺 **[{title}]({url})** 방송 상태 변경\n"
-        if started_users:
-            message += "🔔 시청 시작: " + ", ".join(f"{NICKNAMES.get(uid, '닉네임')}({uid})" for uid in started_users) + "\n"
-        if stopped_users:
-            message += "🔕 시청 종료: " + ", ".join(f"{NICKNAMES.get(uid, '닉네임')}({uid})" for uid in stopped_users)
-
-        await send_discord(message)
+        # 종료 알림은 간단히 텍스트로 처리 (옵션)
+        stopped_viewers = [(uid, NICKNAMES.get(uid, uid)) for uid, action in events if action == "stopped"]
+        if stopped_viewers:
+            await send_individual_embed(title, url, "", stopped_viewers, bj_nick, started=False)
 
     if not anyone_watching_now and any(PREV_WATCHING[uid] for uid in TARGET_IDS):
         await send_discord("📴 감시 대상들이 현재 어떤 방송도 시청하지 않고 있습니다.")
@@ -326,9 +369,9 @@ async def main():
 
     streams = await extract_starcraft_streams()
     print(f"{now()} 📺 감시 대상 방송 수: {len(streams)}")
-    await batch_watch(streams, batch_size=30, limit=30)
+    await batch_watch(streams, batch_size=20, limit=20)
     await compare_and_alert_watch_changes(streams)
-    print(f"{now()} 📺 2분 뒤에 감시 시작")
+    print(f"{now()} 📺 2분 뒤에 감시 재시작")
 
 async def main_loop():
     while True:
